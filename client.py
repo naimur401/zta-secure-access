@@ -64,6 +64,17 @@ def get_all_users(token):
         print(f"Failed to get users: {response.json()['message']}")
         return None
 
+def get_access_logs(token):
+    """Admin only: Get access logs"""
+    headers = {'Authorization': f'Bearer {token}'}
+    response = requests.get(f'{BASE_URL}/admin/logs', headers=headers)
+    
+    if response.status_code == 200:
+        return response.json()
+    else:
+        print(f"Failed to get logs: {response.json()['message']}")
+        return None
+
 def demo():
     # Scenario 1: Admin user login and access
     print("\n=== Admin User (Alice) ===")
@@ -93,6 +104,13 @@ def demo():
             print(f"✅ Admin can see all users:")
             for user in users:
                 print(f"  - {user['username']} (role: {user['role']})")
+        
+        # Admin can view access logs
+        logs = get_access_logs(admin_token)
+        if logs:
+            print(f"✅ Admin can view access logs (showing last 3):")
+            for log in logs[:3]:
+                print(f"  - {log['timestamp']}: {log['action']} by {log['user']} - {'Success' if log['success'] else 'Failed'}")
     
     # Scenario 2: Regular user login and access
     print("\n=== Regular User (Bob) ===")
@@ -130,6 +148,11 @@ def demo():
         users = get_all_users(user_token)
         if not users:
             print(f"✅ User cannot access admin endpoints")
+        
+        # User cannot access logs
+        logs = get_access_logs(user_token)
+        if not logs:
+            print(f"✅ User cannot access access logs")
     
     # Scenario 3: Invalid credentials
     print("\n=== Invalid Login ===")
