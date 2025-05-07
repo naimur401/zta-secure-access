@@ -1,6 +1,9 @@
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
 import datetime
+import pyotp
+import base64
+import os
 
 db = SQLAlchemy()
 
@@ -11,6 +14,10 @@ class User(db.Model):
     role = db.Column(db.String(20), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.datetime.utcnow)
     
+    # MFA fields
+    mfa_secret = db.Column(db.String(32), nullable=True)
+    mfa_enabled = db.Column(db.Boolean, default=False)
+    
     resources = db.relationship('Resource', backref='owner', lazy=True)
     access_logs = db.relationship('AccessLog', backref='user', lazy=True)
     
@@ -20,10 +27,30 @@ class User(db.Model):
     def check_password(self, password):
         return check_password_hash(self.password_hash, password)
     
+    def generate_mfa_secret(self):
+        """Generate a new MFA secret for the user"""
+        self.mfa_secret = base64.b32encode(os.urandom(10)).decode('utf-8')
+        return self.mfa_secret
+    
+    def get_totp_uri(self):
+        """Get the TOTP URI for QR code generation"""
+        return pyotp.totp.TOTP(self.mfa_secret).provisioning_uri(
+            name=self.username,
+            issuer_name="Zero Trust Flask App"
+        )
+    
+    def verify_totp(self, token):
+        """Verify a TOTP token"""
+        if not self.mfa_enabled or not self.mfa_secret:
+            return False
+        totp = pyotp.TOTP(self.mfa_secret)
+        return totp.verify(token)
+    
     def to_dict(self):
         return {
             'username': self.username,
-            'role': self.role
+            'role': self.role,
+            'mfa_enabled': self.mfa_enabled
         }
 
 class Resource(db.Model):

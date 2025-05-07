@@ -5,13 +5,25 @@ import datetime
 import logging
 import uuid
 import os
+import pyotp
+import qrcode
+import io
+import base64
 from werkzeug.security import generate_password_hash, check_password_hash
 from models import db, User, Resource, AccessLog
 
-app = Flask(__name__)
+# Create Flask app
+app = Flask(__name__, instance_relative_config=True)
+
+# Configure app
 app.config['SECRET_KEY'] = 'your-secret-key'  # In production, use a secure environment variable
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///zero_trust.db'
+
+# Set the correct database path to use the instance folder
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(app.instance_path, 'zero_trust.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# Ensure the instance folder exists
+os.makedirs(app.instance_path, exist_ok=True)
 
 # Initialize the database with the app
 db.init_app(app)
@@ -22,10 +34,12 @@ logger = logging.getLogger(__name__)
 
 # Function to initialize the database
 def init_db():
+    # Create tables if they don't exist
     db.create_all()
     
     # Check if we need to create initial data
     if User.query.count() == 0:
+        print("Creating initial data...")
         # Create admin user
         admin = User(username='alice', role='admin')
         admin.set_password('password123')
@@ -60,6 +74,8 @@ def init_db():
         db.session.commit()
         
         logger.info("Initial data created")
+    else:
+        print("Database already contains data, skipping initialization")
 
 # Zero Trust Principle 1: Verify explicitly - Authentication
 def token_required(f):
@@ -226,6 +242,24 @@ def login():
     log_entry.user_id = user.id
     
     if user.check_password(auth.get('password')):
+        # Check if MFA is enabled for this user
+        if user.mfa_enabled:
+            # If MFA is enabled, we need a verification code
+            if not auth.get('mfa_code'):
+                db.session.add(log_entry)
+                db.session.commit()
+                return jsonify({
+                    'message': 'MFA code required',
+                    'mfa_required': True
+                }), 401
+            
+            # Verify the MFA code
+            if not user.verify_totp(auth.get('mfa_code')):
+                logger.warning(f"Invalid MFA code for user {username}")
+                db.session.add(log_entry)
+                db.session.commit()
+                return jsonify({'message': 'Invalid MFA code'}), 401
+        
         # Generate JWT token
         token = jwt.encode({
             'username': username,
@@ -238,13 +272,99 @@ def login():
         db.session.commit()
         
         logger.info(f"User {username} logged in successfully")
-        return jsonify({'token': token})
+        return jsonify({
+            'token': token,
+            'mfa_enabled': user.mfa_enabled
+        })
     
     # Password check failed
     db.session.add(log_entry)
     db.session.commit()
     logger.warning(f"Failed login attempt for user {username}")
     return jsonify({'message': 'Invalid credentials'}), 401
+
+@app.route('/mfa/setup', methods=['POST'])
+@token_required
+def setup_mfa():
+    """Set up MFA for the authenticated user"""
+    user = g.current_user
+    
+    # Generate a new MFA secret
+    secret = user.generate_mfa_secret()
+    
+    # Generate a QR code for easy setup
+    totp_uri = user.get_totp_uri()
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(totp_uri)
+    qr.make(fit=True)
+    
+    img = qr.make_image(fill_color="black", back_color="white")
+    
+    # Convert the image to a base64 string
+    buffered = io.BytesIO()
+    img.save(buffered)
+    img_str = base64.b64encode(buffered.getvalue()).decode()
+    
+    # Save the secret but don't enable MFA yet
+    db.session.commit()
+    
+    return jsonify({
+        'secret': secret,
+        'qr_code': img_str
+    })
+
+@app.route('/mfa/verify', methods=['POST'])
+@token_required
+def verify_mfa():
+    """Verify and enable MFA for the authenticated user"""
+    user = g.current_user
+    data = request.json
+    
+    if not data or not data.get('code'):
+        return jsonify({'message': 'Verification code required'}), 400
+    
+    # Create a TOTP object
+    totp = pyotp.TOTP(user.mfa_secret)
+    
+    # Verify the code
+    if totp.verify(data.get('code')):
+        # Enable MFA for the user
+        user.mfa_enabled = True
+        db.session.commit()
+        
+        logger.info(f"MFA enabled for user {user.username}")
+        return jsonify({'message': 'MFA enabled successfully'})
+    else:
+        logger.warning(f"Invalid MFA verification code for user {user.username}")
+        return jsonify({'message': 'Invalid verification code'}), 400
+
+@app.route('/mfa/disable', methods=['POST'])
+@token_required
+def disable_mfa():
+    """Disable MFA for the authenticated user"""
+    user = g.current_user
+    data = request.json
+    
+    if not data or not data.get('code'):
+        return jsonify({'message': 'Verification code required'}), 400
+    
+    # Verify the code before disabling MFA
+    if user.verify_totp(data.get('code')):
+        # Disable MFA
+        user.mfa_enabled = False
+        user.mfa_secret = None
+        db.session.commit()
+        
+        logger.info(f"MFA disabled for user {user.username}")
+        return jsonify({'message': 'MFA disabled successfully'})
+    else:
+        logger.warning(f"Invalid MFA code when attempting to disable MFA for user {user.username}")
+        return jsonify({'message': 'Invalid verification code'}), 400
 
 @app.route('/resources', methods=['GET'])
 @token_required
@@ -341,6 +461,9 @@ if __name__ == '__main__':
     print("Zero Trust Flask Application running!")
     print("Available endpoints:")
     print("  POST /login - Get authentication token")
+    print("  POST /mfa/setup - Set up MFA for authenticated user")
+    print("  POST /mfa/verify - Verify and enable MFA")
+    print("  POST /mfa/disable - Disable MFA")
     print("  GET /resources - List accessible resources")
     print("  GET /resources/<id> - Get specific resource")
     print("  PUT /resources/<id> - Update specific resource")
